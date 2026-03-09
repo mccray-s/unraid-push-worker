@@ -18,7 +18,7 @@ export interface Env {
  */
 interface UserData {
 	device_token?: string;
-	servers?: Record<string, string>;
+	servers?: Record<string, { name: string; webhook_token: string } | string>; // Support old and new format
 	is_enabled?: boolean;
 	created_at?: string;
 	updated_at?: string;
@@ -39,12 +39,12 @@ export default {
 				return await handleRegister(request, env);
 			}
 
-			// 2. Route: POST /webhook/:deck_id/:server_id
-			const webhookRegex = /^\/webhook\/([^/]+)\/([^/]+)$/;
-			const webhookMatch = path.match(webhookRegex);
-			if (webhookMatch && method === 'POST') {
-				const [, deckId, serverId] = webhookMatch;
-				return await handleWebhook(request, env, ctx, deckId, serverId);
+			// 2. Route: POST /webhook/:token
+			const webhookTokenRegex = /^\/webhook\/([^/]+)$/;
+			const webhookTokenMatch = path.match(webhookTokenRegex);
+			if (webhookTokenMatch && method === 'POST') {
+				const [, token] = webhookTokenMatch;
+				return await handleWebhookToken(request, env, ctx, token);
 			}
 
 			// 3. Route: GET /stats
@@ -101,6 +101,53 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 		userData.created_at = now;
 	}
 
+	// Validate new tokens for collisions before saving anything
+	if (servers) {
+		for (const serverId of Object.keys(servers)) {
+			const serverData = servers[serverId];
+			if (typeof serverData === 'object' && serverData.webhook_token) {
+				const tokenKey = `token:${serverData.webhook_token}`;
+				const existingTokenStr = await env.DECK_KV.get(tokenKey);
+
+				if (existingTokenStr) {
+					try {
+						const existingTokenInfo = JSON.parse(existingTokenStr);
+						// If the token exists but belongs to a different device or server, it's a collision
+						if (existingTokenInfo.deck_id !== deck_id || existingTokenInfo.server_id !== serverId) {
+							return jsonResponse({
+								success: false,
+								error: 'Token collision detected',
+								collided_token: serverData.webhook_token
+							}, 409);
+						}
+					} catch (e) {
+						// Invalid JSON in KV, safe to overwrite
+					}
+				}
+			}
+		}
+	}
+
+	// Find orphaned tokens that need to be deleted
+	const tokensToDelete: string[] = [];
+	if (servers && existingDataStr) {
+		for (const serverId of Object.keys(userData.servers || {})) {
+			const oldServerData = (userData.servers as any)[serverId];
+			const newServerData = servers[serverId];
+
+			// If server was deleted, or token changed
+			if (typeof oldServerData === 'object' && oldServerData.webhook_token) {
+				const oldToken = oldServerData.webhook_token;
+				const isDeleted = !newServerData;
+				const isChanged = newServerData && typeof newServerData === 'object' && newServerData.webhook_token !== oldToken;
+
+				if (isDeleted || isChanged) {
+					tokensToDelete.push(`token:${oldToken}`);
+				}
+			}
+		}
+	}
+
 	// Update fields selectively
 	if (device_token !== undefined) userData.device_token = device_token;
 	if (servers !== undefined) userData.servers = servers;
@@ -108,8 +155,24 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 
 	userData.updated_at = now;
 
-	// Persist to KV
+	// Persist User Data to KV
 	await env.DECK_KV.put(deck_id, JSON.stringify(userData));
+
+	// Save new token mappings
+	if (servers) {
+		for (const serverId of Object.keys(servers)) {
+			const serverData = servers[serverId];
+			if (typeof serverData === 'object' && serverData.webhook_token) {
+				const tokenInfo = { deck_id, server_id: serverId };
+				await env.DECK_KV.put(`token:${serverData.webhook_token}`, JSON.stringify(tokenInfo));
+			}
+		}
+	}
+
+	// Clean up orphaned tokens
+	for (const oldTokenKey of tokensToDelete) {
+		await env.DECK_KV.delete(oldTokenKey);
+	}
 
 	// If new user, update global and daily registration stats
 	if (isNewUser) {
@@ -119,6 +182,38 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 	}
 
 	return jsonResponse({ success: true, is_new_user: isNewUser });
+}
+
+/**
+ * Handles Unraid webhook alerts via short token.
+ * POST /webhook/:token
+ */
+async function handleWebhookToken(
+	request: Request,
+	env: Env,
+	ctx: ExecutionContext,
+	token: string
+): Promise<Response> {
+	// 1. Look up deck_id and server_id from token
+	const tokenDataStr = await env.DECK_KV.get(`token:${token}`);
+	if (!tokenDataStr) {
+		return new Response(`Invalid webhook token: ${token}`, { status: 404 });
+	}
+
+	let tokenInfo;
+	try {
+		tokenInfo = JSON.parse(tokenDataStr);
+	} catch (e) {
+		return new Response(`Corrupted token data`, { status: 500 });
+	}
+
+	const { deck_id, server_id } = tokenInfo;
+	if (!deck_id || !server_id) {
+		return new Response(`Invalid token mapping`, { status: 500 });
+	}
+
+	// 2. Forward to the main webhook handler
+	return handleWebhook(request, env, ctx, deck_id, server_id);
 }
 
 /**
@@ -165,7 +260,9 @@ async function handleWebhook(
 	}
 
 	// Check if server is authorized for this device
-	const serverName = userData.servers?.[serverId];
+	const serverEntry = userData.servers?.[serverId];
+	const serverName = typeof serverEntry === 'object' ? serverEntry.name : serverEntry;
+
 	if (!serverName) {
 		return new Response(`Unauthorized: Server ID ${serverId} is not registered.`, { status: 403 });
 	}
