@@ -1,0 +1,34 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "unraid-push-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-01",
+	"observability": {
+		"enabled": true
+	},
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	/**
+	 * Smart Placement
+	 */
+	// "placement": {  "mode": "smart" }
+	/**
+	 * Bindings
+	 */
+	/**
+	 * Environment Variables
+	 * Note: Use 'npx wrangler secret put <NAME>' for sensitive data.
+	 */
+	// "vars": {  "MY_VARIABLE": "production_value" },
+	"kv_namespaces": [
+		{
+			"binding": "DECK_KV",
+			"id": "YOUR_KV_NAMESPACE_ID_HERE"
+		}
+	]
+}
