@@ -25,10 +25,11 @@
 	 * Note: Use 'npx wrangler secret put <NAME>' for sensitive data.
 	 */
 	// "vars": {  "MY_VARIABLE": "production_value" },
-	"kv_namespaces": [
+	"d1_databases": [
 		{
-			"binding": "DECK_KV",
-			"id": "YOUR_KV_NAMESPACE_ID_HERE"
+			"binding": "DB",
+			"database_name": "unraid-push-db",
+			"database_id": "YOUR_D1_DATABASE_ID_HERE"
 		}
 	]
 }

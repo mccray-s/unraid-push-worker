@@ -28,9 +28,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Inject KV ID
+      - name: Inject D1 ID
         run: |
-          sed -i 's/DECK_KV_ID_PLACEHOLDER/${{ secrets.DECK_KV_ID }}/g' wrangler.jsonc
+          sed -i 's/D1_ID_PLACEHOLDER/${{ secrets.D1_DATABASE_ID }}/g' wrangler.jsonc
 
       - name: Deploy
         uses: cloudflare/wrangler-action@v3

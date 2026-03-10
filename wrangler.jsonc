@@ -6,7 +6,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "unraid-push-worker",
 	"main": "src/index.ts",
-	"compatibility_date": "2026-03-09",
+	"compatibility_date": "2026-03-10",
 	"observability": {
 		"enabled": true
 	},
@@ -38,10 +38,12 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ],
-	"kv_namespaces": [
+	"d1_databases": [
 		{
-			"binding": "DECK_KV",
-			"id": "DECK_KV_ID_PLACEHOLDER"
+			"binding": "DB",
+			"database_name": "unraid-push-db",
+			"database_id": "D1_ID_PLACEHOLDER"
+			
 		}
 	]
 }

@@ -1,10 +1,7 @@
 import * as jose from 'jose';
 
-/**
- * Environment variables and bindings for the Worker.
- */
 export interface Env {
-	DECK_KV: KVNamespace;
+	DB: D1Database;
 	APNS_TEAM_ID: string;
 	APNS_KEY_ID: string;
 	APNS_BUNDLE_ID: string;
@@ -13,20 +10,24 @@ export interface Env {
 	APNS_HOST: string;
 }
 
-/**
- * User data structure stored in KV.
- */
-interface UserData {
+interface RegisterRequest {
+	deck_id: string;
 	device_token?: string;
-	servers?: Record<string, { name: string; webhook_token: string } | string>; // Support old and new format
 	is_enabled?: boolean;
-	created_at?: string;
-	updated_at?: string;
+	server_ids?: string[];
 }
 
-/**
- * Main Fetch Handler
- */
+interface WebhookRotateRequest {
+	server_id: string;
+}
+
+interface WebhookPayload {
+	event?: string;
+	subject?: string;
+	description?: string;
+	importance?: string;
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -34,12 +35,14 @@ export default {
 		const method = request.method;
 
 		try {
-			// 1. Route: POST /register
 			if (path === '/register' && method === 'POST') {
 				return await handleRegister(request, env);
 			}
 
-			// 2. Route: POST /webhook/:token
+			if (path === '/webhook/rotate' && method === 'POST') {
+				return await handleWebhookRotate(request, env);
+			}
+
 			const webhookTokenRegex = /^\/webhook\/([^/]+)$/;
 			const webhookTokenMatch = path.match(webhookTokenRegex);
 			if (webhookTokenMatch && method === 'POST') {
@@ -47,7 +50,6 @@ export default {
 				return await handleWebhookToken(request, env, ctx, token);
 			}
 
-			// 3. Route: GET /stats
 			if (path === '/stats' && method === 'GET') {
 				return await handleStats(request, env);
 			}
@@ -65,169 +67,141 @@ export default {
 // ==========================================
 
 /**
- * Handles device registration/update.
+ * Handle Device Registration and Subscription
  * POST /register
  */
 async function handleRegister(request: Request, env: Env): Promise<Response> {
-	let body: any;
+	let body: RegisterRequest;
 	try {
 		body = await request.json();
 	} catch (e) {
 		return new Response('Invalid JSON body', { status: 400 });
 	}
 
-	const { deck_id, device_token, servers, is_enabled } = body;
+	const { deck_id, device_token, is_enabled } = body;
 	if (!deck_id) {
 		return new Response('Missing deck_id', { status: 400 });
 	}
 
-	// Fetch existing user data
-	const existingDataStr = await env.DECK_KV.get(deck_id);
-	const isNewUser = !existingDataStr;
+	const serverIds: string[] = Array.isArray(body.server_ids) ? body.server_ids : [];
+	const isEnabledInt = is_enabled !== false ? 1 : 0;
 
-	let userData: UserData = {};
-	const now = new Date().toISOString();
+	if (device_token) {
+		await env.DB.prepare(
+			`
+			INSERT INTO devices (deck_id, device_token, is_enabled) 
+			VALUES (?1, ?2, ?3)
+			ON CONFLICT(deck_id) DO UPDATE SET 
+				device_token = ?2,
+				is_enabled = ?3,
+				updated_at = CURRENT_TIMESTAMP
+		`,
+		)
+			.bind(deck_id, device_token, isEnabledInt)
+			.run();
+	} else {
+		await env.DB.prepare(
+			`
+            UPDATE devices SET is_enabled = ?2, updated_at = CURRENT_TIMESTAMP WHERE deck_id = ?1
+        `,
+		)
+			.bind(deck_id, isEnabledInt)
+			.run();
+	}
 
-	if (existingDataStr) {
-		try {
-			userData = JSON.parse(existingDataStr);
-		} catch (e) {
-			userData = {};
+	const assignedTokens: Record<string, string> = {};
+
+	for (const serverId of serverIds) {
+		const newToken = await generateUniqueToken(env.DB);
+
+		await env.DB.prepare(
+			`
+            INSERT INTO servers (server_id, webhook_token)
+            VALUES (?1, ?2)
+            ON CONFLICT(server_id) DO NOTHING
+        `,
+		)
+			.bind(serverId, newToken)
+			.run();
+
+		const tokenObj = await env.DB.prepare(
+			`
+            SELECT webhook_token FROM servers WHERE server_id = ?
+        `,
+		)
+			.bind(serverId)
+			.first('webhook_token');
+
+		if (tokenObj) {
+			assignedTokens[serverId] = tokenObj as string;
 		}
+
+		await env.DB.prepare(
+			`
+            INSERT INTO server_subscriptions (server_id, deck_id)
+            VALUES (?1, ?2)
+            ON CONFLICT(server_id, deck_id) DO NOTHING
+        `,
+		)
+			.bind(serverId, deck_id)
+			.run();
 	}
 
-	// Initialize created_at if not present
-	if (!userData.created_at) {
-		userData.created_at = now;
+	if (serverIds.length > 0) {
+		const placeholders = serverIds.map(() => '?').join(',');
+		await env.DB.prepare(
+			`
+            DELETE FROM server_subscriptions 
+            WHERE deck_id = ? AND server_id NOT IN (${placeholders})
+        `,
+		)
+			.bind(deck_id, ...serverIds)
+			.run();
+	} else {
+		await env.DB.prepare(`DELETE FROM server_subscriptions WHERE deck_id = ?`).bind(deck_id).run();
 	}
 
-	// Validate new tokens for collisions before saving anything
-	if (servers) {
-		for (const serverId of Object.keys(servers)) {
-			const serverData = servers[serverId];
-			if (typeof serverData === 'object' && serverData.webhook_token) {
-				const tokenKey = `token:${serverData.webhook_token}`;
-				const existingTokenStr = await env.DECK_KV.get(tokenKey);
-
-				if (existingTokenStr) {
-					try {
-						const existingTokenInfo = JSON.parse(existingTokenStr);
-						// If the token exists but belongs to a different device or server, it's a collision
-						if (existingTokenInfo.deck_id !== deck_id || existingTokenInfo.server_id !== serverId) {
-							return jsonResponse({
-								success: false,
-								error: 'Token collision detected',
-								collided_token: serverData.webhook_token
-							}, 409);
-						}
-					} catch (e) {
-						// Invalid JSON in KV, safe to overwrite
-					}
-				}
-			}
-		}
-	}
-
-	// Find orphaned tokens that need to be deleted
-	const tokensToDelete: string[] = [];
-	if (servers && existingDataStr) {
-		for (const serverId of Object.keys(userData.servers || {})) {
-			const oldServerData = (userData.servers as any)[serverId];
-			const newServerData = servers[serverId];
-
-			// If server was deleted, or token changed
-			if (typeof oldServerData === 'object' && oldServerData.webhook_token) {
-				const oldToken = oldServerData.webhook_token;
-				const isDeleted = !newServerData;
-				const isChanged = newServerData && typeof newServerData === 'object' && newServerData.webhook_token !== oldToken;
-
-				if (isDeleted || isChanged) {
-					tokensToDelete.push(`token:${oldToken}`);
-				}
-			}
-		}
-	}
-
-	// Update fields selectively
-	if (device_token !== undefined) userData.device_token = device_token;
-	if (servers !== undefined) userData.servers = servers;
-	if (is_enabled !== undefined) userData.is_enabled = is_enabled;
-
-	userData.updated_at = now;
-
-	// Persist User Data to KV
-	await env.DECK_KV.put(deck_id, JSON.stringify(userData));
-
-	// Save new token mappings
-	if (servers) {
-		for (const serverId of Object.keys(servers)) {
-			const serverData = servers[serverId];
-			if (typeof serverData === 'object' && serverData.webhook_token) {
-				const tokenInfo = { deck_id, server_id: serverId };
-				await env.DECK_KV.put(`token:${serverData.webhook_token}`, JSON.stringify(tokenInfo));
-			}
-		}
-	}
-
-	// Clean up orphaned tokens
-	for (const oldTokenKey of tokensToDelete) {
-		await env.DECK_KV.delete(oldTokenKey);
-	}
-
-	// If new user, update global and daily registration stats
-	if (isNewUser) {
-		const today = getTodayString();
-		await incrementKvCounter(env.DECK_KV, 'stats:users:total');
-		await incrementKvCounter(env.DECK_KV, `stats:users:${today}`);
-	}
-
-	return jsonResponse({ success: true, is_new_user: isNewUser });
+	return jsonResponse({ success: true, tokens: assignedTokens });
 }
 
 /**
- * Handles Unraid webhook alerts via short token.
+ * Handle Webhook Token Rotation
+ * POST /webhook/rotate
+ */
+async function handleWebhookRotate(request: Request, env: Env): Promise<Response> {
+	let body: WebhookRotateRequest;
+	try {
+		body = await request.json();
+	} catch (e) {
+		return new Response('Invalid JSON body', { status: 400 });
+	}
+
+	const { server_id } = body;
+	if (!server_id) return new Response('Missing server_id', { status: 400 });
+
+	const newToken = await generateUniqueToken(env.DB);
+
+	const result = await env.DB.prepare(
+		`
+		UPDATE servers SET webhook_token = ?1 WHERE server_id = ?2
+	`,
+	)
+		.bind(newToken, server_id)
+		.run();
+
+	if (result.meta.changes === 0) {
+		return new Response('Server not found', { status: 404 });
+	}
+
+	return jsonResponse({ success: true, new_token: newToken });
+}
+
+/**
+ * Handle Unraid Webhook Push Broadcasting
  * POST /webhook/:token
  */
-async function handleWebhookToken(
-	request: Request,
-	env: Env,
-	ctx: ExecutionContext,
-	token: string
-): Promise<Response> {
-	// 1. Look up deck_id and server_id from token
-	const tokenDataStr = await env.DECK_KV.get(`token:${token}`);
-	if (!tokenDataStr) {
-		return new Response(`Invalid webhook token: ${token}`, { status: 404 });
-	}
-
-	let tokenInfo;
-	try {
-		tokenInfo = JSON.parse(tokenDataStr);
-	} catch (e) {
-		return new Response(`Corrupted token data`, { status: 500 });
-	}
-
-	const { deck_id, server_id } = tokenInfo;
-	if (!deck_id || !server_id) {
-		return new Response(`Invalid token mapping`, { status: 500 });
-	}
-
-	// 2. Forward to the main webhook handler
-	return handleWebhook(request, env, ctx, deck_id, server_id);
-}
-
-/**
- * Handles Unraid webhook alerts and forwards them to APNs.
- * POST /webhook/:deck_id/:server_id
- */
-async function handleWebhook(
-	request: Request,
-	env: Env,
-	ctx: ExecutionContext,
-	deckId: string,
-	serverId: string
-): Promise<Response> {
-	let payload: any;
+async function handleWebhookToken(request: Request, env: Env, ctx: ExecutionContext, token: string): Promise<Response> {
+	let payload: WebhookPayload;
 	try {
 		payload = await request.json();
 	} catch (e) {
@@ -236,85 +210,93 @@ async function handleWebhook(
 
 	const { event, subject, description, importance } = payload;
 
-	// Validate user and permissions
-	const userDataStr = await env.DECK_KV.get(deckId);
-	if (!userDataStr) {
-		return new Response(`Device not found for deck_id: ${deckId}`, { status: 404 });
+	const results = await env.DB.prepare(
+		`
+		SELECT s.server_id, d.device_token FROM servers s
+		LEFT JOIN server_subscriptions sub ON s.server_id = sub.server_id
+		LEFT JOIN devices d ON sub.deck_id = d.deck_id AND d.is_enabled = 1
+		WHERE s.webhook_token = ?
+	`,
+	)
+		.bind(token)
+		.all();
+
+	if (!results.results || results.results.length === 0) {
+		return new Response(`Invalid webhook token`, { status: 404 });
 	}
 
-	let userData: UserData;
-	try {
-		userData = JSON.parse(userDataStr);
-	} catch (e) {
-		return new Response(`Corrupted data for deck_id: ${deckId}`, { status: 500 });
-	}
-
-	// Check if user has disabled notifications
-	if (userData.is_enabled === false) {
-		return new Response(`Notifications disabled for deck_id: ${deckId}`, { status: 403 });
-	}
-
-	const deviceToken = userData.device_token;
-	if (!deviceToken) {
-		return new Response(`No device token for deck_id: ${deckId}`, { status: 400 });
-	}
-
-	// Check if server is authorized for this device
-	const serverEntry = userData.servers?.[serverId];
-	const serverName = typeof serverEntry === 'object' ? serverEntry.name : serverEntry;
-
-	if (!serverName) {
-		return new Response(`Unauthorized: Server ID ${serverId} is not registered.`, { status: 403 });
-	}
+	const serverId = results.results[0].server_id as string;
+	const deviceTokens = results.results.map((r) => r.device_token as string).filter((t) => !!t);
 
 	const apnsPayload = {
 		aps: {
 			alert: {
 				title: subject || 'Unraid Server Alert',
-				subtitle: serverName, // Display server name in subtitle
 				body: description || `Event: ${event || 'Unknown'}`,
 			},
 			sound: 'default',
-			'interruption-level': (importance === 'warning' || importance === 'alert') ? 'active' : 'active',
-			'thread-id': serverId, // Group notifications by server
-			'mutable-content': 1 // Essential for iOS Service Extension badge updates
+			'interruption-level': importance === 'warning' || importance === 'alert' ? 'time-sensitive' : 'active',
+			'thread-id': serverId,
+			'mutable-content': 1,
 		},
 		server_id: serverId,
-		server_name: serverName,
 		event,
-		importance
+		importance,
 	};
 
 	try {
 		const jwt = await generateApnsJwt(env.APNS_P8_KEY, env.APNS_KEY_ID, env.APNS_TEAM_ID);
 		const apnsHost = env.APNS_HOST || 'api.push.apple.com';
-		const url = `https://${apnsHost}/3/device/${deviceToken}`;
 
-		const apnsResponse = await fetch(url, {
-			method: 'POST',
-			headers: {
-				'authorization': `bearer ${jwt}`,
-				'apns-topic': env.APNS_BUNDLE_ID,
-				'apns-push-type': 'alert',
-				'apns-priority': '10',
-			},
-			body: JSON.stringify(apnsPayload),
+		const sendPromises = deviceTokens.map(async (deviceToken) => {
+			const url = `https://${apnsHost}/3/device/${deviceToken}`;
+			const apnsResponse = await fetch(url, {
+				method: 'POST',
+				headers: {
+					authorization: `bearer ${jwt}`,
+					'apns-topic': env.APNS_BUNDLE_ID,
+					'apns-push-type': 'alert',
+					'apns-priority': '10',
+				},
+				body: JSON.stringify(apnsPayload),
+			});
+
+			if (!apnsResponse.ok) {
+				const errorText = await apnsResponse.text();
+				console.error(`APNs Error for ${deviceToken}: ${apnsResponse.status} - ${errorText}`);
+
+				if (apnsResponse.status === 410) {
+					await env.DB.prepare(`DELETE FROM devices WHERE device_token = ?`).bind(deviceToken).run();
+				}
+			}
 		});
 
-		if (!apnsResponse.ok) {
-			const errorText = await apnsResponse.text();
-			console.error(`APNs Gateway Error: ${apnsResponse.status} - ${errorText}`);
-			// Note: 410 Unregistered should ideally trigger token cleanup in a production system.
-			return new Response(`APNs delivery failed: ${errorText}`, { status: apnsResponse.status });
-		}
+		await Promise.all(sendPromises);
 
-		// Update message statistics asynchronously
-		ctx.waitUntil((async () => {
-			const today = getTodayString();
-			await incrementKvCounter(env.DECK_KV, `stats:msg:${today}`);
-		})());
+		ctx.waitUntil(
+			(async () => {
+				const today = getTodayString();
 
-		return jsonResponse({ success: true });
+				await env.DB.prepare(
+					`
+				UPDATE servers SET message_count = message_count + 1 WHERE webhook_token = ?
+			`,
+				)
+					.bind(token)
+					.run();
+
+				await env.DB.prepare(
+					`
+                INSERT INTO message_stats (date, message_count) VALUES (?1, 1)
+                ON CONFLICT(date) DO UPDATE SET message_count = message_count + 1
+            `,
+				)
+					.bind(today)
+					.run();
+			})(),
+		);
+
+		return jsonResponse({ success: true, broadcast_count: deviceTokens.length });
 	} catch (error: any) {
 		console.error('APNs Request Failure:', error);
 		return new Response(`APNs Communication Error: ${error.message}`, { status: 500 });
@@ -322,74 +304,82 @@ async function handleWebhook(
 }
 
 /**
- * Retrieves aggregate statistics.
+ * Retrieves aggregate statistics from D1.
  * GET /stats
  */
 async function handleStats(request: Request, env: Env): Promise<Response> {
-	// Authentication
 	const authHeader = request.headers.get('Authorization');
 	if (!authHeader || authHeader !== `Bearer ${env.ADMIN_SECRET}`) {
 		return new Response('Unauthorized', { status: 401 });
 	}
 
-	// Fetch all keys with 'stats:' prefix
-	const statsList = await env.DECK_KV.list({ prefix: 'stats:' });
-	const keys = statsList.keys.map(k => k.name);
+	const totalUsers = await env.DB.prepare(`SELECT count(*) as total FROM devices`).first('total');
 
-	// Fetch all values in parallel for better performance
-	const values = await Promise.all(keys.map(key => env.DECK_KV.get(key)));
+	const userStats = await env.DB.prepare(
+		`
+        SELECT date(created_at) as date, count(*) as count 
+        FROM devices 
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT 30
+    `,
+	).all();
 
-	const result: any = {
-		total_users: 0,
-		daily_stats: {}
-	};
+	const msgStats = await env.DB.prepare(
+		`
+        SELECT date, message_count as count 
+        FROM message_stats 
+        ORDER BY date DESC
+        LIMIT 30
+    `,
+	).all();
 
-	keys.forEach((key, index) => {
-		const val = parseInt(values[index] || '0', 10);
-		if (key === 'stats:users:total') {
-			result.total_users = val;
-		} else if (key.startsWith('stats:users:')) {
-			const date = key.replace('stats:users:', '');
-			ensureDateStat(result.daily_stats, date);
-			result.daily_stats[date].new_users = val;
-		} else if (key.startsWith('stats:msg:')) {
-			const date = key.replace('stats:msg:', '');
-			ensureDateStat(result.daily_stats, date);
-			result.daily_stats[date].messages = val;
-		}
+	const topServers = await env.DB.prepare(
+		`
+        SELECT server_id, message_count as count
+        FROM servers
+        ORDER BY message_count DESC
+        LIMIT 10
+    `,
+	).all();
+
+	const daily_stats: Record<string, { new_users: number; messages: number }> = {};
+
+	for (const row of userStats.results) {
+		const d = row.date as string;
+		if (!daily_stats[d]) daily_stats[d] = { new_users: 0, messages: 0 };
+		daily_stats[d].new_users = Number(row.count);
+	}
+
+	for (const row of msgStats.results) {
+		const d = row.date as string;
+		if (!daily_stats[d]) daily_stats[d] = { new_users: 0, messages: 0 };
+		daily_stats[d].messages = Number(row.count);
+	}
+
+	return jsonResponse({
+		total_users: Number(totalUsers || 0),
+		top_active_servers: topServers.results,
+		daily_stats,
 	});
-
-	return jsonResponse(result);
 }
 
 // ==========================================
 // Helpers
 // ==========================================
 
-/**
- * Generates an APNs compliant JWT.
- */
 async function generateApnsJwt(pkcs8Pem: string, kid: string, iss: string): Promise<string> {
 	let formattedPem = pkcs8Pem;
-	// Add PEM headers if missing
 	if (!formattedPem.includes('-----BEGIN PRIVATE KEY-----')) {
 		formattedPem = `-----BEGIN PRIVATE KEY-----\n${formattedPem}\n-----END PRIVATE KEY-----`;
 	}
-	// Normalize escaped newlines
 	formattedPem = formattedPem.replace(/\\n/g, '\n');
 
 	const privateKey = await jose.importPKCS8(formattedPem, 'ES256');
 
-	return await new jose.SignJWT({})
-		.setProtectedHeader({ alg: 'ES256', kid })
-		.setIssuedAt()
-		.setIssuer(iss)
-		.sign(privateKey);
+	return await new jose.SignJWT({}).setProtectedHeader({ alg: 'ES256', kid }).setIssuedAt().setIssuer(iss).sign(privateKey);
 }
 
-/**
- * Returns the current date in YYYY-MM-DD format.
- */
 function getTodayString(): string {
 	const date = new Date();
 	const year = date.getUTCFullYear();
@@ -398,27 +388,24 @@ function getTodayString(): string {
 	return `${year}-${month}-${day}`;
 }
 
-/**
- * Atomic-like increment for KV counters.
- */
-async function incrementKvCounter(kv: KVNamespace, key: string): Promise<void> {
-	const currentVal = await kv.get(key) || '0';
-	const newVal = (parseInt(currentVal, 10) + 1).toString();
-	await kv.put(key, newVal);
-}
+async function generateUniqueToken(db: D1Database): Promise<string> {
+	const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
-/**
- * Utility to ensure daily_stats object is initialized for a specific date.
- */
-function ensureDateStat(stats: any, date: string) {
-	if (!stats[date]) {
-		stats[date] = { new_users: 0, messages: 0 };
+	while (true) {
+		let token = '';
+		const randomValues = new Uint8Array(10);
+		crypto.getRandomValues(randomValues);
+		for (let i = 0; i < 10; i++) {
+			token += chars[randomValues[i] % chars.length];
+		}
+
+		const existing = await db.prepare('SELECT 1 FROM servers WHERE webhook_token = ?').bind(token).first();
+		if (!existing) {
+			return token;
+		}
 	}
 }
 
-/**
- * Standard JSON response helper.
- */
 function jsonResponse(data: any, status = 200): Response {
 	return new Response(JSON.stringify(data, null, 2), {
 		status,
