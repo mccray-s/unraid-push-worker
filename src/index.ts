@@ -8,6 +8,7 @@ export interface Env {
 	APNS_P8_KEY: string;
 	ADMIN_SECRET: string;
 	APNS_HOST: string;
+	APP_SECRET: string;
 }
 
 interface RegisterRequest {
@@ -38,8 +39,11 @@ export default {
 				return await handleRegister(request, env);
 			}
 
-			if (path === '/webhook/rotate' && method === 'POST') {
-				return await handleWebhookRotate(request, env);
+			const webhookRotateRegex = /^\/webhook\/([^/]+)\/rotate$/;
+			const webhookRotateMatch = path.match(webhookRotateRegex);
+			if (webhookRotateMatch && method === 'POST') {
+				const [, token] = webhookRotateMatch;
+				return await handleWebhookRotate(request, env, token);
 			}
 
 			const webhookTokenRegex = /^\/webhook\/([^/]+)$/;
@@ -70,9 +74,20 @@ export default {
  * POST /register
  */
 async function handleRegister(request: Request, env: Env): Promise<Response> {
+	// HMAC signature verification
+	const signature = request.headers.get('X-Signature');
+	if (!signature) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+	const bodyText = await request.text();
+	const isValid = await verifyHmacSignature(bodyText, signature, env.APP_SECRET);
+	if (!isValid) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+
 	let body: RegisterRequest;
 	try {
-		body = await request.json();
+		body = JSON.parse(bodyText);
 	} catch (e) {
 		return new Response('Invalid JSON body', { status: 400 });
 	}
@@ -167,7 +182,7 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
  * Handle Webhook Token Rotation
  * POST /webhook/rotate
  */
-async function handleWebhookRotate(request: Request, env: Env): Promise<Response> {
+async function handleWebhookRotate(request: Request, env: Env, currentToken: string): Promise<Response> {
 	let body: WebhookRotateRequest;
 	try {
 		body = await request.json();
@@ -178,19 +193,22 @@ async function handleWebhookRotate(request: Request, env: Env): Promise<Response
 	const { server_id } = body;
 	if (!server_id) return new Response('Missing server_id', { status: 400 });
 
+	// Verify that the provided token matches the server_id in DB
+	const existing = await env.DB.prepare(
+		`SELECT 1 FROM servers WHERE server_id = ? AND webhook_token = ?`,
+	)
+		.bind(server_id, currentToken)
+		.first();
+
+	if (!existing) {
+		return new Response('Forbidden', { status: 403 });
+	}
+
 	const newToken = await generateUniqueToken(env.DB);
 
-	const result = await env.DB.prepare(
-		`
-		UPDATE servers SET webhook_token = ?1 WHERE server_id = ?2
-	`,
-	)
+	await env.DB.prepare(`UPDATE servers SET webhook_token = ?1 WHERE server_id = ?2`)
 		.bind(newToken, server_id)
 		.run();
-
-	if (result.meta.changes === 0) {
-		return new Response('Server not found', { status: 404 });
-	}
 
 	return jsonResponse({ success: true, new_token: newToken });
 }
@@ -365,6 +383,32 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 // ==========================================
 // Helpers
 // ==========================================
+
+/**
+ * Verify HMAC-SHA256 signature: HMAC(body, APP_SECRET)
+ */
+async function verifyHmacSignature(body: string, signature: string, secret: string): Promise<boolean> {
+	const encoder = new TextEncoder();
+	const key = await crypto.subtle.importKey(
+		'raw',
+		encoder.encode(secret),
+		{ name: 'HMAC', hash: 'SHA-256' },
+		false,
+		['verify'],
+	);
+	const sigBytes = hexToBytes(signature);
+	if (!sigBytes) return false;
+	return await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(body));
+}
+
+function hexToBytes(hex: string): Uint8Array | null {
+	if (hex.length % 2 !== 0) return null;
+	const bytes = new Uint8Array(hex.length / 2);
+	for (let i = 0; i < hex.length; i += 2) {
+		bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+	}
+	return bytes;
+}
 
 async function generateApnsJwt(pkcs8Pem: string, kid: string, iss: string): Promise<string> {
 	let formattedPem = pkcs8Pem;
