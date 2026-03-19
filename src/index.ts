@@ -23,9 +23,11 @@ interface WebhookRotateRequest {
 }
 
 interface WebhookPayload {
-	subject?: string;
-	description?: string;
+	title?: string;
+	message?: string;
 	importance?: string;
+	timestamp?: string;
+	link?: string;
 }
 
 export default {
@@ -225,7 +227,7 @@ async function handleWebhookToken(request: Request, env: Env, ctx: ExecutionCont
 		return new Response('Invalid JSON body', { status: 400 });
 	}
 
-	const { subject, description, importance } = payload;
+	const { title, message, importance, timestamp, link } = payload;
 
 	const results = await env.DB.prepare(
 		`
@@ -248,16 +250,18 @@ async function handleWebhookToken(request: Request, env: Env, ctx: ExecutionCont
 	const apnsPayload = {
 		aps: {
 			alert: {
-				title: subject || 'Unraid Server Alert',
-				body: description || '',
+				title: title || 'Unraid Server Alert',
+				body: message || '',
 			},
 			sound: 'default',
-			'interruption-level': importance === 'warning' || importance === 'alert' ? 'time-sensitive' : 'active',
+			'interruption-level': importance?.toLowerCase() === 'warning' || importance?.toLowerCase() === 'alert' ? 'time-sensitive' : 'active',
 			'thread-id': serverId,
 			'mutable-content': 1,
 		},
 		server_id: serverId,
 		importance,
+		timestamp,
+		link,
 	};
 
 	try {
