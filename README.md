@@ -20,11 +20,13 @@ The official push notification bridge for **[Unraid Deck](https://unraid.mccray.
 - **Security-First**: Built-in support for Admin Secret authentication and Apple's secure Token-based Provider API.
 - **Privacy & Control**: Designed to handle sensitive device tokens and server identifiers with strict isolation.
 - **Highly Reliable**: Engineered for 99.9% uptime by utilizing Cloudflare's robust serverless infrastructure.
-- **Message Analytics**: Integrated Cloudflare KV storage for tracking delivery stats and managing device-to-server relationships.
+- **Message Analytics**: Uses Cloudflare D1 to track delivery stats and device-to-server relationships.
 
 ## Technical Specs
 
 - **Runtime**: Cloudflare Workers (TypeScript)
 - **Messaging Protocol**: HTTP/2 APNs Token-based Provider API
-- **Storage**: Cloudflare KV (Statistics and metadata management)
-- **Authentication**: Bearer Token authentication for administrative and webhook endpoints
+- **Storage**: Cloudflare D1 (devices, subscriptions, stats)
+- **Authentication**:
+  - HMAC request signing for `POST /register`
+  - Bearer token authentication for `GET /stats`
