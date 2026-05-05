@@ -5,10 +5,15 @@ interface DailyStatsEntry {
 	messages: number;
 }
 
+interface DailyStatsItem extends DailyStatsEntry {
+	date: string;
+}
+
 interface StatsPayload {
 	total_users: number;
+	total_messages: number;
 	top_active_servers: unknown[];
-	daily_stats: Record<string, DailyStatsEntry>;
+	daily_stats: DailyStatsItem[];
 }
 
 /**
@@ -16,6 +21,9 @@ interface StatsPayload {
  */
 export async function fetchStatsPayload(env: Env): Promise<StatsPayload> {
 	const totalUsers = await env.DB.prepare(`SELECT count(*) as total FROM devices`).first('total');
+	const totalMessages = await env.DB.prepare(`SELECT coalesce(sum(message_count), 0) as total FROM message_stats`).first(
+		'total',
+	);
 
 	const userStats = await env.DB.prepare(
 		`
@@ -63,10 +71,14 @@ export async function fetchStatsPayload(env: Env): Promise<StatsPayload> {
 		dailyStats[date].messages = Number(row.count);
 	}
 
+	const sortedDailyStats = Object.entries(dailyStats)
+		.sort(([dateA], [dateB]) => dateB.localeCompare(dateA))
+		.map(([date, stats]) => ({ date, ...stats }));
+
 	return {
 		total_users: Number(totalUsers || 0),
+		total_messages: Number(totalMessages || 0),
 		top_active_servers: topServers.results,
-		daily_stats: dailyStats,
+		daily_stats: sortedDailyStats,
 	};
 }
-
